@@ -4,7 +4,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 
-COPY app.py entrypoint.sh ./
+COPY app.py ./
+COPY entrypoint.sh /entrypoint.sh
 COPY load-test.js ./
 
 RUN chmod +x /entrypoint.sh
