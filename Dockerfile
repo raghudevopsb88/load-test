@@ -4,9 +4,11 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 
-COPY app.py ./
+COPY app.py entrypoint.sh ./
 COPY load-test.js ./
+
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+ENTRYPOINT ["/entrypoint.sh"]

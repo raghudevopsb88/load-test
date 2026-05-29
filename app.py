@@ -1,13 +1,19 @@
 import asyncio
+import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 import httpx
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=1)
+DEFAULT_BASE_URL = os.getenv("BASE_URL", "").strip()
+DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip()
+DEFAULT_DURATION = os.getenv("DURATION", "").strip()
+DEFAULT_PORT = os.getenv("PORT", "").strip()
 
 HTML = """
 <!DOCTYPE html>
@@ -51,20 +57,24 @@ HTML = """
         <h1>RoboShop Load Tester</h1>
         <div class="form-group">
             <label>Application Base URL (nginx / frontend)</label>
-            <input type="text" id="baseUrl" placeholder="http://localhost:3000" />
+            <input type="text" id="baseUrl" placeholder="http://roboshop-frontend-dev.raghudevopsb88.online" value="{{ default_base_url }}" />
         </div>
         <div class="row">
             <div class="form-group">
                 <label>Concurrent Users</label>
-                <input type="number" id="concurrency" value="10" min="1" />
+                <input type="number" id="concurrency" value="{{ default_concurrency }}" min="1" />
             </div>
             <div class="form-group">
                 <label>Duration (seconds)</label>
-                <input type="number" id="duration" value="60" min="5" />
+                <input type="number" id="duration" value="{{ default_duration }}" min="5" />
             </div>
         </div>
         <button id="runBtn" onclick="runTest()">Start Load Test</button>
         <button id="stopBtn" class="stop" onclick="stopTest()" style="display:none;">Stop</button>
+
+        <div class="info">
+            <strong>Base URL:</strong> Use the RoboShop frontend / nginx entry point only (not individual microservice URLs). Example: <code>http://roboshop-frontend-dev.raghudevopsb88.online</code>. Required env vars: <code>BASE_URL</code>, <code>CONCURRENCY</code>, <code>DURATION</code>, <code>PORT</code>.
+        </div>
 
         <div class="info">
             <strong>Full Journey Test:</strong> Each virtual user will Browse Catalogue &rarr; Register &rarr; Login &rarr; Profile &rarr; Shipping &rarr; Add to Cart &rarr; Checkout &rarr; Orders &rarr; Rate Product (repeating until duration ends). All traffic flows through the nginx reverse proxy at the base URL.
@@ -156,21 +166,54 @@ stop_flag = False
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return render_template_string(
+        HTML,
+        default_base_url=DEFAULT_BASE_URL,
+        default_concurrency=DEFAULT_CONCURRENCY,
+        default_duration=DEFAULT_DURATION,
+    )
+
+
+def normalize_base_url(url):
+    """Accept full URLs or hostnames and return scheme://host[:port]."""
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid base URL: {url}")
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("base URL must use http or https")
+
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
 
 @app.route("/api/run", methods=["POST"])
 def run_test():
     global test_state, stop_flag
-    data = request.json
+    data = request.json or {}
+    try:
+        base_url = normalize_base_url(data.get("base_url"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     stop_flag = False
     test_state = {
         "done": False, "success": 0, "errors": 0,
         "avg_ms": 0, "rps": 0, "p50_ms": 0, "p95_ms": 0, "max_ms": 0,
-        "elapsed_s": 0, "duration_s": data["duration"],
+        "elapsed_s": 0, "duration_s": data.get("duration", 60),
     }
-    executor.submit(run_load_test, data)
-    return jsonify({"status": "started"})
+    executor.submit(run_load_test, {
+        "base_url": base_url,
+        "concurrency": data.get("concurrency", 10),
+        "duration": data.get("duration", 60),
+    })
+    return jsonify({"status": "started", "base_url": base_url})
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -187,7 +230,7 @@ def status():
 
 def run_load_test(data):
     global test_state, stop_flag
-    base_url = data["base_url"].rstrip("/")
+    base_url = normalize_base_url(data["base_url"])
     concurrency = data["concurrency"]
     duration = data["duration"]
 
@@ -258,7 +301,7 @@ def run_load_test(data):
 
             # --- Shipping ---
             if not cities:
-                cities_resp = await do_request(client, "GET", f"{base_url}/api/shipping/shipping/cities",
+                cities_resp = await do_request(client, "GET", f"{base_url}/api/shipping/cities",
                                                latencies=latencies, start_time=start_time)
                 if cities_resp is not None and cities_resp.status_code == 200:
                     try:
@@ -266,38 +309,38 @@ def run_load_test(data):
                     except Exception:
                         cities = []
             city_id = random.choice(cities).get("id") if cities else 1
-            await do_request(client, "GET", f"{base_url}/api/shipping/shipping/calc?cityId={city_id}",
+            await do_request(client, "GET", f"{base_url}/api/shipping/calc?cityId={city_id}",
                              latencies=latencies, start_time=start_time)
 
             # --- Cart ---
-            await do_request(client, "POST", f"{base_url}/api/cart/cart/{user_uuid}/add",
+            await do_request(client, "POST", f"{base_url}/api/cart/{user_uuid}/add",
                              json={"productId": product_id, "quantity": 1},
                              latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/cart/cart/{user_uuid}",
+            await do_request(client, "GET", f"{base_url}/api/cart/{user_uuid}",
                              latencies=latencies, start_time=start_time)
-            await do_request(client, "PUT", f"{base_url}/api/cart/cart/{user_uuid}/update",
+            await do_request(client, "PUT", f"{base_url}/api/cart/{user_uuid}/update",
                              json={"productId": product_id, "quantity": 2},
                              latencies=latencies, start_time=start_time)
 
             # --- Checkout (publishes order event to RabbitMQ) ---
-            await do_request(client, "POST", f"{base_url}/api/payment/payment/process",
+            await do_request(client, "POST", f"{base_url}/api/payment/process",
                              json={"userId": user_uuid, "cityId": city_id},
                              latencies=latencies, start_time=start_time)
 
             # --- Orders (orders consumer is async; give it a moment) ---
             await asyncio.sleep(0.5)
-            await do_request(client, "GET", f"{base_url}/api/orders/orders/user/{user_uuid}",
+            await do_request(client, "GET", f"{base_url}/api/orders/user/{user_uuid}",
                              latencies=latencies, start_time=start_time)
 
             # --- Rate product ---
             rating_product = random.randint(1, 12)
-            await do_request(client, "POST", f"{base_url}/api/ratings/ratings",
+            await do_request(client, "POST", f"{base_url}/api/ratings",
                              json={"productId": rating_product, "userId": user_uuid,
                                    "score": random.randint(1, 5), "review": "Load test review"},
                              latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/ratings/ratings/product/{rating_product}",
+            await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}",
                              latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/ratings/ratings/product/{rating_product}/average",
+            await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}/average",
                              latencies=latencies, start_time=start_time)
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -351,4 +394,6 @@ def update_stats(latencies, start_time):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    if not DEFAULT_PORT:
+        raise SystemExit("PORT is required")
+    app.run(host="0.0.0.0", port=int(DEFAULT_PORT))
