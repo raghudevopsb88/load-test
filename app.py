@@ -39,6 +39,22 @@ def response_body_snippet(resp):
     except Exception:
         return "<unable to read response body>"
 
+
+def parse_user_id(user_obj):
+    uid = (user_obj or {}).get("id")
+    if uid is None:
+        return None
+    if isinstance(uid, dict):
+        return uid.get("$oid") or str(uid)
+    return str(uid)
+
+
+def make_http_client():
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=15.0, pool=120.0),
+        limits=httpx.Limits(max_connections=25, max_keepalive_connections=15),
+    )
+
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -261,113 +277,119 @@ def run_load_test(data):
     latencies = []
     start_time = time.time()
 
-    async def user_journey(client, user_id):
+    async def user_journey(user_id):
         """Full RoboShop journey through the nginx reverse proxy."""
-        token = None
-        user_uuid = None
-        cities = []
+        async with make_http_client() as client:
+            token = None
+            user_uuid = None
+            cities = []
 
-        while (time.time() - start_time) < duration and not stop_flag:
-            # --- Browse catalogue ---
-            await do_request(client, "GET", f"{base_url}/api/catalogue/products",
-                             latencies=latencies, start_time=start_time)
-            cat_resp = await do_request(client, "GET", f"{base_url}/api/catalogue/categories",
-                                        latencies=latencies, start_time=start_time)
-            category = None
-            if cat_resp is not None and cat_resp.status_code == 200:
-                try:
-                    cats = cat_resp.json()
-                    if cats:
-                        category = random.choice(cats)
-                except Exception:
-                    pass
-            if category:
-                await do_request(client, "GET",
-                                 f"{base_url}/api/catalogue/products?category={category}",
+            while (time.time() - start_time) < duration and not stop_flag:
+                token = None
+                user_uuid = None
+
+                # --- Browse catalogue ---
+                await do_request(client, "GET", f"{base_url}/api/catalogue/products",
                                  latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/catalogue/products/search?q=robot",
-                             latencies=latencies, start_time=start_time)
-
-            product_id = random.randint(1, 12)
-            await do_request(client, "GET", f"{base_url}/api/catalogue/products/{product_id}",
-                             latencies=latencies, start_time=start_time)
-
-            # --- Register & login ---
-            uname = f"loaduser_{user_id}_{random.randint(1000000000, 9999999999)}"
-            email = f"{uname}@test.com"
-            password = "LoadTest123!"
-            await do_request(client, "POST", f"{base_url}/api/user/register",
-                             json={"username": uname, "email": email, "password": password,
-                                   "firstName": "Load", "lastName": "Test"},
-                             latencies=latencies, start_time=start_time)
-            login_resp = await do_request(client, "POST", f"{base_url}/api/user/login",
-                                          json={"username": uname, "password": password},
-                                          latencies=latencies, start_time=start_time)
-            if login_resp is not None and login_resp.status_code == 200:
-                try:
-                    body = login_resp.json()
-                    token = body.get("token")
-                    user_obj = body.get("user") or {}
-                    user_uuid = user_obj.get("id")
-                except Exception:
-                    pass
-
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-
-            # --- Profile (uses JWT) ---
-            await do_request(client, "GET", f"{base_url}/api/user/profile",
-                             headers=headers, latencies=latencies, start_time=start_time)
-
-            # Skip remainder if login failed
-            if not user_uuid:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                continue
-
-            # --- Shipping ---
-            if not cities:
-                cities_resp = await do_request(client, "GET", f"{base_url}/api/shipping/cities",
-                                               latencies=latencies, start_time=start_time)
-                if cities_resp is not None and cities_resp.status_code == 200:
+                cat_resp = await do_request(client, "GET", f"{base_url}/api/catalogue/categories",
+                                            latencies=latencies, start_time=start_time)
+                category = None
+                if cat_resp is not None and cat_resp.status_code == 200:
                     try:
-                        cities = cities_resp.json() or []
+                        cats = cat_resp.json()
+                        if cats:
+                            category = random.choice(cats)
                     except Exception:
-                        cities = []
-            city_id = random.choice(cities).get("id") if cities else 1
-            await do_request(client, "GET", f"{base_url}/api/shipping/calc?cityId={city_id}",
-                             latencies=latencies, start_time=start_time)
+                        pass
+                if category:
+                    await do_request(client, "GET",
+                                     f"{base_url}/api/catalogue/products?category={category}",
+                                     latencies=latencies, start_time=start_time)
+                await do_request(client, "GET", f"{base_url}/api/catalogue/products/search?q=robot",
+                                 latencies=latencies, start_time=start_time)
 
-            # --- Cart ---
-            await do_request(client, "POST", f"{base_url}/api/cart/{user_uuid}/add",
-                             json={"productId": product_id, "quantity": 1},
-                             latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/cart/{user_uuid}",
-                             latencies=latencies, start_time=start_time)
-            await do_request(client, "PUT", f"{base_url}/api/cart/{user_uuid}/update",
-                             json={"productId": product_id, "quantity": 2},
-                             latencies=latencies, start_time=start_time)
+                product_id = random.randint(1, 12)
+                await do_request(client, "GET", f"{base_url}/api/catalogue/products/{product_id}",
+                                 latencies=latencies, start_time=start_time)
 
-            # --- Checkout (publishes order event to RabbitMQ) ---
-            await do_request(client, "POST", f"{base_url}/api/payment/process",
-                             json={"userId": user_uuid, "cityId": city_id},
-                             latencies=latencies, start_time=start_time)
+                # --- Register & login ---
+                uname = f"loaduser_{user_id}_{random.randint(1000000000, 9999999999)}"
+                email = f"{uname}@test.com"
+                password = "LoadTest123!"
+                reg_resp = await do_request(client, "POST", f"{base_url}/api/user/register",
+                                 json={"username": uname, "email": email, "password": password,
+                                       "firstName": "Load", "lastName": "Test"},
+                                 latencies=latencies, start_time=start_time)
+                if reg_resp is None or reg_resp.status_code >= 300:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    continue
 
-            # --- Orders (orders consumer is async; give it a moment) ---
-            await asyncio.sleep(0.5)
-            await do_request(client, "GET", f"{base_url}/api/orders/user/{user_uuid}",
-                             latencies=latencies, start_time=start_time)
+                login_resp = await do_request(client, "POST", f"{base_url}/api/user/login",
+                                              json={"username": uname, "password": password},
+                                              latencies=latencies, start_time=start_time)
+                if login_resp is not None and login_resp.status_code == 200:
+                    try:
+                        body = login_resp.json()
+                        token = body.get("token")
+                        user_uuid = parse_user_id(body.get("user") or {})
+                    except Exception:
+                        pass
 
-            # --- Rate product ---
-            rating_product = random.randint(1, 12)
-            await do_request(client, "POST", f"{base_url}/api/ratings",
-                             json={"productId": rating_product, "userId": user_uuid,
-                                   "score": random.randint(1, 5), "review": "Load test review"},
-                             latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}",
-                             latencies=latencies, start_time=start_time)
-            await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}/average",
-                             latencies=latencies, start_time=start_time)
+                if not token or not user_uuid:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    continue
 
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+                headers = {"Authorization": f"Bearer {token}"}
+
+                # --- Profile (uses JWT) ---
+                await do_request(client, "GET", f"{base_url}/api/user/profile",
+                                 headers=headers, latencies=latencies, start_time=start_time)
+
+                # --- Shipping ---
+                if not cities:
+                    cities_resp = await do_request(client, "GET", f"{base_url}/api/shipping/cities",
+                                                   latencies=latencies, start_time=start_time)
+                    if cities_resp is not None and cities_resp.status_code == 200:
+                        try:
+                            cities = cities_resp.json() or []
+                        except Exception:
+                            cities = []
+                city_id = random.choice(cities).get("id") if cities else 1
+                await do_request(client, "GET", f"{base_url}/api/shipping/calc?cityId={city_id}",
+                                 latencies=latencies, start_time=start_time)
+
+                # --- Cart ---
+                await do_request(client, "POST", f"{base_url}/api/cart/{user_uuid}/add",
+                                 json={"productId": product_id, "quantity": 1},
+                                 latencies=latencies, start_time=start_time)
+                await do_request(client, "GET", f"{base_url}/api/cart/{user_uuid}",
+                                 latencies=latencies, start_time=start_time)
+                await do_request(client, "PUT", f"{base_url}/api/cart/{user_uuid}/update",
+                                 json={"productId": product_id, "quantity": 2},
+                                 latencies=latencies, start_time=start_time)
+
+                # --- Checkout (publishes order event to RabbitMQ) ---
+                await do_request(client, "POST", f"{base_url}/api/payment/process",
+                                 json={"userId": user_uuid, "cityId": city_id},
+                                 latencies=latencies, start_time=start_time)
+
+                # --- Orders (orders consumer is async; give it a moment) ---
+                await asyncio.sleep(0.5)
+                await do_request(client, "GET", f"{base_url}/api/orders/user/{user_uuid}",
+                                 latencies=latencies, start_time=start_time)
+
+                # --- Rate product ---
+                rating_product = random.randint(1, 12)
+                await do_request(client, "POST", f"{base_url}/api/ratings",
+                                 json={"productId": rating_product, "userId": user_uuid,
+                                       "score": random.randint(1, 5), "review": "Load test review"},
+                                 latencies=latencies, start_time=start_time)
+                await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}",
+                                 latencies=latencies, start_time=start_time)
+                await do_request(client, "GET", f"{base_url}/api/ratings/product/{rating_product}/average",
+                                 latencies=latencies, start_time=start_time)
+
+                await asyncio.sleep(random.uniform(0.5, 1.5))
 
     async def do_request(client, method, url, json=None, headers=None, latencies=None, start_time=None):
         req_start = time.time()
@@ -398,9 +420,8 @@ def run_load_test(data):
             return None
 
     async def run():
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            tasks = [user_journey(client, i) for i in range(concurrency)]
-            await asyncio.gather(*tasks)
+        tasks = [user_journey(i) for i in range(concurrency)]
+        await asyncio.gather(*tasks)
 
     asyncio.run(run())
 
