@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -14,6 +15,29 @@ DEFAULT_BASE_URL = os.getenv("BASE_URL", "").strip()
 DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip()
 DEFAULT_DURATION = os.getenv("DURATION", "").strip()
 DEFAULT_PORT = os.getenv("PORT", "").strip()
+ERROR_BODY_MAX = int(os.getenv("ERROR_BODY_MAX", "500"))
+
+
+def log_request_error(method, url, status_code=None, body=None, exc=None):
+    """Print failed request details to stdout for docker logs."""
+    parts = [f"LOAD_TEST_ERROR method={method} url={url}"]
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    if body:
+        snippet = body.replace("\n", " ").strip()
+        if len(snippet) > ERROR_BODY_MAX:
+            snippet = snippet[:ERROR_BODY_MAX] + "..."
+        parts.append(f"body={snippet}")
+    if exc is not None:
+        parts.append(f"error={type(exc).__name__}: {exc}")
+    print(" ".join(parts), file=sys.stdout, flush=True)
+
+
+def response_body_snippet(resp):
+    try:
+        return resp.text
+    except Exception:
+        return "<unable to read response body>"
 
 HTML = """
 <!DOCTYPE html>
@@ -356,13 +380,20 @@ def run_load_test(data):
                 test_state["success"] += 1
             else:
                 test_state["errors"] += 1
+                log_request_error(
+                    method,
+                    url,
+                    status_code=resp.status_code,
+                    body=response_body_snippet(resp),
+                )
 
             update_stats(latencies, start_time)
             return resp
-        except Exception:
+        except Exception as exc:
             elapsed_ms = round((time.time() - req_start) * 1000, 1)
             latencies.append(elapsed_ms)
             test_state["errors"] += 1
+            log_request_error(method, url, exc=exc)
             update_stats(latencies, start_time)
             return None
 
