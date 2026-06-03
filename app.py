@@ -276,9 +276,12 @@ def run_load_test(data):
 
     latencies = []
     start_time = time.time()
+    auth_semaphore = asyncio.Semaphore(max(2, min(concurrency, 8)))
 
     async def user_journey(user_id):
         """Full RoboShop journey through the nginx reverse proxy."""
+        await asyncio.sleep(user_id * 0.25)
+
         async with make_http_client() as client:
             token = None
             user_uuid = None
@@ -312,21 +315,23 @@ def run_load_test(data):
                 await do_request(client, "GET", f"{base_url}/api/catalogue/products/{product_id}",
                                  latencies=latencies, start_time=start_time)
 
-                # --- Register & login ---
+                # --- Register & login (throttled — bcrypt is CPU-heavy on user service) ---
                 uname = f"loaduser_{user_id}_{random.randint(1000000000, 9999999999)}"
                 email = f"{uname}@test.com"
                 password = "LoadTest123!"
-                reg_resp = await do_request(client, "POST", f"{base_url}/api/user/register",
-                                 json={"username": uname, "email": email, "password": password,
-                                       "firstName": "Load", "lastName": "Test"},
-                                 latencies=latencies, start_time=start_time)
-                if reg_resp is None or reg_resp.status_code >= 300:
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-                    continue
+                async with auth_semaphore:
+                    reg_resp = await do_request(client, "POST", f"{base_url}/api/user/register",
+                                     json={"username": uname, "email": email, "password": password,
+                                           "firstName": "Load", "lastName": "Test"},
+                                     latencies=latencies, start_time=start_time)
+                    if reg_resp is None or reg_resp.status_code >= 300:
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        continue
 
-                login_resp = await do_request(client, "POST", f"{base_url}/api/user/login",
-                                              json={"username": uname, "password": password},
-                                              latencies=latencies, start_time=start_time)
+                    await asyncio.sleep(0.2)
+                    login_resp = await do_request(client, "POST", f"{base_url}/api/user/login",
+                                                  json={"username": uname, "password": password},
+                                                  latencies=latencies, start_time=start_time)
                 if login_resp is not None and login_resp.status_code == 200:
                     try:
                         body = login_resp.json()
@@ -358,20 +363,41 @@ def run_load_test(data):
                 await do_request(client, "GET", f"{base_url}/api/shipping/calc?cityId={city_id}",
                                  latencies=latencies, start_time=start_time)
 
-                # --- Cart ---
-                await do_request(client, "POST", f"{base_url}/api/cart/{user_uuid}/add",
-                                 json={"productId": product_id, "quantity": 1},
-                                 latencies=latencies, start_time=start_time)
-                await do_request(client, "GET", f"{base_url}/api/cart/{user_uuid}",
-                                 latencies=latencies, start_time=start_time)
+                # --- Cart (payment needs non-empty cart + user validate upstream) ---
+                add_resp = await do_request(client, "POST", f"{base_url}/api/cart/{user_uuid}/add",
+                                            json={"productId": product_id, "quantity": 1},
+                                            latencies=latencies, start_time=start_time)
+                if add_resp is None or add_resp.status_code >= 300:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    continue
+
+                cart_resp = await do_request(client, "GET", f"{base_url}/api/cart/{user_uuid}",
+                                             latencies=latencies, start_time=start_time)
+                cart_ok = False
+                if cart_resp is not None and cart_resp.status_code == 200:
+                    try:
+                        cart_ok = bool((cart_resp.json() or {}).get("items"))
+                    except Exception:
+                        cart_ok = False
+                if not cart_ok:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    continue
+
                 await do_request(client, "PUT", f"{base_url}/api/cart/{user_uuid}/update",
                                  json={"productId": product_id, "quantity": 2},
                                  latencies=latencies, start_time=start_time)
 
-                # --- Checkout (publishes order event to RabbitMQ) ---
-                await do_request(client, "POST", f"{base_url}/api/payment/process",
-                                 json={"userId": user_uuid, "cityId": city_id},
-                                 latencies=latencies, start_time=start_time)
+                # --- Checkout (payment calls user validate + cart; retry on transient 503) ---
+                await asyncio.sleep(0.15)
+                pay_payload = {"userId": user_uuid, "cityId": city_id}
+                pay_resp = await do_request(client, "POST", f"{base_url}/api/payment/process",
+                                            json=pay_payload,
+                                            latencies=latencies, start_time=start_time)
+                if pay_resp is not None and pay_resp.status_code == 503:
+                    await asyncio.sleep(0.5)
+                    await do_request(client, "POST", f"{base_url}/api/payment/process",
+                                     json=pay_payload,
+                                     latencies=latencies, start_time=start_time)
 
                 # --- Orders (orders consumer is async; give it a moment) ---
                 await asyncio.sleep(0.5)
