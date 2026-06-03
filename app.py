@@ -1,8 +1,10 @@
 import asyncio
 import os
 import random
+import socket
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -11,9 +13,10 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=1)
+state_lock = threading.Lock()
 DEFAULT_BASE_URL = os.getenv("BASE_URL", "").strip()
-DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip()
-DEFAULT_DURATION = os.getenv("DURATION", "").strip()
+DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip() or "10"
+DEFAULT_DURATION = os.getenv("DURATION", "").strip() or "60"
 DEFAULT_PORT = os.getenv("PORT", "").strip()
 ERROR_BODY_MAX = int(os.getenv("ERROR_BODY_MAX", "500"))
 
@@ -144,51 +147,96 @@ HTML = """
 
         async function runTest() {
             const baseUrl = document.getElementById('baseUrl').value.trim();
-            const concurrency = parseInt(document.getElementById('concurrency').value);
-            const duration = parseInt(document.getElementById('duration').value);
+            const concurrency = parseInt(document.getElementById('concurrency').value, 10) || 10;
+            const duration = parseInt(document.getElementById('duration').value, 10) || 60;
 
             if (!baseUrl) { alert('Enter the application base URL'); return; }
+            if (concurrency < 1 || duration < 1) {
+                alert('Concurrency and duration must be at least 1');
+                return;
+            }
 
             document.getElementById('runBtn').disabled = true;
             document.getElementById('stopBtn').style.display = 'inline-block';
             document.getElementById('results').classList.add('show');
-            document.getElementById('statusText').textContent = 'Running...';
+            document.getElementById('statusText').textContent = 'Starting...';
             document.getElementById('progressFill').style.width = '0%';
             ['successCount','errorCount','totalRequests','rps','avgTime','p50Time','p95Time','maxTime'].forEach(id => document.getElementById(id).textContent = '0');
 
-            await fetch('/api/run', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ base_url: baseUrl, concurrency, duration }) });
-
+            if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollStatus, 500);
+            pollStatus();
+
+            const runResp = await fetch('/api/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ base_url: baseUrl, concurrency, duration }),
+            });
+            const runData = await runResp.json().catch(() => ({}));
+            if (!runResp.ok) {
+                clearInterval(pollInterval);
+                document.getElementById('statusText').textContent = 'Start failed: ' + (runData.error || runResp.status);
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('stopBtn').style.display = 'none';
+                return;
+            }
+            pollStatus();
         }
 
         async function stopTest() {
             await fetch('/api/stop', { method: 'POST' });
         }
 
+        function statNum(value) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : 0;
+        }
+
         async function pollStatus() {
-            const res = await fetch('/api/status');
-            const data = await res.json();
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
 
-            const elapsed = data.elapsed_s || 0;
-            const total = data.duration_s || 1;
-            const pct = Math.min(100, Math.round((elapsed / total) * 100));
-            document.getElementById('progressFill').style.width = pct + '%';
-            document.getElementById('successCount').textContent = data.success;
-            document.getElementById('errorCount').textContent = data.errors;
-            document.getElementById('totalRequests').textContent = data.success + data.errors;
-            document.getElementById('rps').textContent = data.rps;
-            document.getElementById('avgTime').textContent = data.avg_ms;
-            document.getElementById('p50Time').textContent = data.p50_ms;
-            document.getElementById('p95Time').textContent = data.p95_ms;
-            document.getElementById('maxTime').textContent = data.max_ms;
+                const success = statNum(data.success);
+                const errors = statNum(data.errors);
+                const total = statNum(data.total_requests ?? (success + errors));
+                const elapsed = statNum(data.elapsed_s);
+                const duration = statNum(data.duration_s) || 1;
+                const pct = Math.min(100, Math.round((elapsed / duration) * 100));
 
-            if (data.done) {
-                clearInterval(pollInterval);
-                document.getElementById('statusText').textContent = `Done — ${data.success + data.errors} requests in ${data.elapsed_s}s`;
-                document.getElementById('runBtn').disabled = false;
-                document.getElementById('stopBtn').style.display = 'none';
-            } else {
-                document.getElementById('statusText').textContent = `Running... ${elapsed}s / ${total}s — ${data.success + data.errors} requests`;
+                document.getElementById('progressFill').style.width = pct + '%';
+                document.getElementById('successCount').textContent = success;
+                document.getElementById('errorCount').textContent = errors;
+                document.getElementById('totalRequests').textContent = total;
+                document.getElementById('rps').textContent = statNum(data.rps);
+                document.getElementById('avgTime').textContent = statNum(data.avg_ms);
+                document.getElementById('p50Time').textContent = statNum(data.p50_ms);
+                document.getElementById('p95Time').textContent = statNum(data.p95_ms);
+                document.getElementById('maxTime').textContent = statNum(data.max_ms);
+
+                if (data.error) {
+                    clearInterval(pollInterval);
+                    document.getElementById('statusText').textContent = 'Failed: ' + data.error;
+                    document.getElementById('runBtn').disabled = false;
+                    document.getElementById('stopBtn').style.display = 'none';
+                    return;
+                }
+
+                const meta = [data.build_id, data.host, data.run_id != null ? 'run#' + data.run_id : ''].filter(Boolean).join(' · ');
+
+                if (data.done) {
+                    clearInterval(pollInterval);
+                    document.getElementById('statusText').textContent =
+                        `Done — ${total} requests in ${elapsed}s` + (meta ? ` (${meta})` : '');
+                    document.getElementById('runBtn').disabled = false;
+                    document.getElementById('stopBtn').style.display = 'none';
+                } else {
+                    document.getElementById('statusText').textContent =
+                        `Running ${elapsed}s / ${duration}s — ${total} requests (${success} ok, ${errors} fail)` +
+                        (meta ? ` [${meta}]` : '');
+                }
+            } catch (err) {
+                document.getElementById('statusText').textContent = 'Status poll failed: ' + err.message;
             }
         }
     </script>
@@ -196,12 +244,49 @@ HTML = """
 </html>
 """
 
-test_state = {
-    "done": True, "success": 0, "errors": 0,
-    "avg_ms": 0, "rps": 0, "p50_ms": 0, "p95_ms": 0, "max_ms": 0,
-    "elapsed_s": 0, "duration_s": 0,
-}
+def new_test_state(duration_s=60, run_id=0):
+    return {
+        "done": True,
+        "success": 0,
+        "errors": 0,
+        "total_requests": 0,
+        "avg_ms": 0,
+        "rps": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "max_ms": 0,
+        "elapsed_s": 0,
+        "duration_s": duration_s,
+        "run_id": run_id,
+        "error": None,
+        "host": socket.gethostname(),
+        "build_id": BUILD_ID,
+    }
+
+
+test_state = new_test_state()
 stop_flag = False
+current_run_id = 0
+BUILD_ID = os.getenv("BUILD_ID", "local")
+
+
+def parse_positive_int(value, default, field_name):
+    if value is None or value == "":
+        return default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a positive integer") from None
+    if n < 1:
+        raise ValueError(f"{field_name} must be at least 1")
+    return n
+
+
+def snapshot_state():
+    with state_lock:
+        state = dict(test_state)
+    state["total_requests"] = state["success"] + state["errors"]
+    return state
 
 
 @app.route("/")
@@ -235,25 +320,40 @@ def normalize_base_url(url):
 
 @app.route("/api/run", methods=["POST"])
 def run_test():
-    global test_state, stop_flag
+    global test_state, stop_flag, current_run_id
     data = request.json or {}
     try:
         base_url = normalize_base_url(data.get("base_url"))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    try:
+        concurrency = parse_positive_int(data.get("concurrency"), 10, "concurrency")
+        duration = parse_positive_int(data.get("duration"), 60, "duration")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    stop_flag = True
+    with state_lock:
+        current_run_id += 1
+        run_id = current_run_id
+        test_state = new_test_state(duration_s=duration, run_id=run_id)
+        test_state["done"] = False
     stop_flag = False
-    test_state = {
-        "done": False, "success": 0, "errors": 0,
-        "avg_ms": 0, "rps": 0, "p50_ms": 0, "p95_ms": 0, "max_ms": 0,
-        "elapsed_s": 0, "duration_s": data.get("duration", 60),
-    }
+
     executor.submit(run_load_test, {
         "base_url": base_url,
-        "concurrency": data.get("concurrency", 10),
-        "duration": data.get("duration", 60),
+        "concurrency": concurrency,
+        "duration": duration,
+        "run_id": run_id,
     })
-    return jsonify({"status": "started", "base_url": base_url})
+    return jsonify({
+        "status": "started",
+        "base_url": base_url,
+        "run_id": run_id,
+        "host": socket.gethostname(),
+        "build_id": BUILD_ID,
+    })
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -265,18 +365,42 @@ def stop_test():
 
 @app.route("/api/status")
 def status():
-    return jsonify(test_state)
+    return jsonify(snapshot_state())
+
+
+@app.route("/api/version")
+def version():
+    return jsonify({"build_id": BUILD_ID, "host": socket.gethostname()})
 
 
 def run_load_test(data):
     global test_state, stop_flag
+    run_id = data["run_id"]
     base_url = normalize_base_url(data["base_url"])
     concurrency = data["concurrency"]
     duration = data["duration"]
 
+    print(
+        f"LOAD_TEST_START run_id={run_id} base_url={base_url} "
+        f"concurrency={concurrency} duration={duration} host={socket.gethostname()}",
+        file=sys.stdout,
+        flush=True,
+    )
+
     latencies = []
     start_time = time.time()
     auth_semaphore = asyncio.Semaphore(max(2, min(concurrency, 8)))
+
+    def is_active_run():
+        return run_id == current_run_id
+
+    def touch_state():
+        if not is_active_run():
+            return
+        with state_lock:
+            if run_id != current_run_id:
+                return
+            update_stats_unlocked(latencies, start_time)
 
     async def user_journey(user_id):
         """Full RoboShop journey through the nginx reverse proxy."""
@@ -316,6 +440,7 @@ def run_load_test(data):
                                  latencies=latencies, start_time=start_time)
 
                 # --- Register & login (throttled — bcrypt is CPU-heavy on user service) ---
+                login_resp = None
                 uname = f"loaduser_{user_id}_{random.randint(1000000000, 9999999999)}"
                 email = f"{uname}@test.com"
                 password = "LoadTest123!"
@@ -422,48 +547,81 @@ def run_load_test(data):
         try:
             resp = await client.request(method, url, json=json, headers=headers)
             elapsed_ms = round((time.time() - req_start) * 1000, 1)
-            latencies.append(elapsed_ms)
 
-            if 200 <= resp.status_code < 300:
-                test_state["success"] += 1
-            else:
-                test_state["errors"] += 1
+            with state_lock:
+                if not is_active_run() or run_id != current_run_id:
+                    return resp
+                if 200 <= resp.status_code < 300:
+                    test_state["success"] += 1
+                else:
+                    test_state["errors"] += 1
+                if latencies is not None:
+                    latencies.append(elapsed_ms)
+                update_stats_unlocked(latencies, start_time)
+
+            if not (200 <= resp.status_code < 300):
                 log_request_error(
                     method,
                     url,
                     status_code=resp.status_code,
                     body=response_body_snippet(resp),
                 )
-
-            update_stats(latencies, start_time)
             return resp
         except Exception as exc:
             elapsed_ms = round((time.time() - req_start) * 1000, 1)
-            latencies.append(elapsed_ms)
-            test_state["errors"] += 1
+            with state_lock:
+                if is_active_run() and run_id == current_run_id:
+                    test_state["errors"] += 1
+                    if latencies is not None:
+                        latencies.append(elapsed_ms)
+                    update_stats_unlocked(latencies, start_time)
             log_request_error(method, url, exc=exc)
-            update_stats(latencies, start_time)
             return None
+
+    async def elapsed_ticker():
+        while is_active_run() and (time.time() - start_time) < duration and not stop_flag:
+            touch_state()
+            await asyncio.sleep(0.5)
 
     async def run():
         tasks = [user_journey(i) for i in range(concurrency)]
+        tasks.append(elapsed_ticker())
         await asyncio.gather(*tasks)
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        logger_msg = f"{type(exc).__name__}: {exc}"
+        print(f"LOAD_TEST_FATAL run_id={run_id} {logger_msg}", file=sys.stdout, flush=True)
+        with state_lock:
+            if run_id == current_run_id:
+                test_state["error"] = logger_msg
+    finally:
+        with state_lock:
+            if run_id != current_run_id:
+                return
+            test_state["done"] = True
+            test_state["elapsed_s"] = round(time.time() - start_time, 1)
+            update_stats_unlocked(latencies, start_time)
+            summary = (
+                f"success={test_state['success']} errors={test_state['errors']} "
+                f"elapsed={test_state['elapsed_s']}s"
+            )
+        print(f"LOAD_TEST_END run_id={run_id} {summary}", file=sys.stdout, flush=True)
 
-    test_state["done"] = True
-    test_state["elapsed_s"] = round(time.time() - start_time, 1)
-    update_stats(latencies, start_time)
 
+def update_stats_unlocked(latencies, start_time):
+    """Update latency/rps fields; caller must hold state_lock."""
+    elapsed = time.time() - start_time
+    test_state["elapsed_s"] = round(elapsed, 1)
+    test_state["total_requests"] = test_state["success"] + test_state["errors"]
 
-def update_stats(latencies, start_time):
     if not latencies:
+        test_state["rps"] = 0
         return
+
     sorted_lat = sorted(latencies)
     n = len(sorted_lat)
-    elapsed = time.time() - start_time
-
-    test_state["elapsed_s"] = round(elapsed, 1)
     test_state["avg_ms"] = round(sum(sorted_lat) / n, 1)
     test_state["max_ms"] = round(sorted_lat[-1], 1)
     test_state["p50_ms"] = round(sorted_lat[int(n * 0.5)], 1)
@@ -474,4 +632,4 @@ def update_stats(latencies, start_time):
 if __name__ == "__main__":
     if not DEFAULT_PORT:
         raise SystemExit("PORT is required")
-    app.run(host="0.0.0.0", port=int(DEFAULT_PORT))
+    app.run(host="0.0.0.0", port=int(DEFAULT_PORT), threaded=True, use_reloader=False)
