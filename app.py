@@ -18,6 +18,7 @@ DEFAULT_BASE_URL = os.getenv("BASE_URL", "").strip()
 DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip() or "10"
 DEFAULT_DURATION = os.getenv("DURATION", "").strip() or "60"
 DEFAULT_PORT = os.getenv("PORT", "").strip()
+BUILD_ID = os.getenv("BUILD_ID", "local")
 ERROR_BODY_MAX = int(os.getenv("ERROR_BODY_MAX", "500"))
 
 
@@ -267,7 +268,6 @@ def new_test_state(duration_s=60, run_id=0):
 test_state = new_test_state()
 stop_flag = False
 current_run_id = 0
-BUILD_ID = os.getenv("BUILD_ID", "local")
 
 
 def parse_positive_int(value, default, field_name):
