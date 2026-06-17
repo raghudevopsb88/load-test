@@ -33,6 +33,7 @@ export CONCURRENCY
 export DURATION
 export PORT
 export BUILD_ID="${BUILD_ID:-local}"
+export AUTO_RUN="${AUTO_RUN:-false}"
 
 export BASE_URL="$(
 python3 - <<'PY'
@@ -67,5 +68,6 @@ echo "  CONCURRENCY=${CONCURRENCY}"
 echo "  DURATION=${DURATION}"
 echo "  PORT=${PORT}"
 echo "  BUILD_ID=${BUILD_ID}"
+echo "  AUTO_RUN=${AUTO_RUN}"
 
 exec python3 app.py

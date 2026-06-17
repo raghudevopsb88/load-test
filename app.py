@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import socket
@@ -147,6 +148,12 @@ HTML = """
     </div>
     <script>
         let pollInterval;
+        let expectedRunId = null;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            pollStatus();
+            pollInterval = setInterval(pollStatus, 1000);
+        });
 
         async function runTest() {
             const baseUrl = document.getElementById('baseUrl').value.trim();
@@ -165,6 +172,7 @@ HTML = """
             document.getElementById('statusText').textContent = 'Checking connectivity...';
             document.getElementById('progressFill').style.width = '0%';
             ['successCount','errorCount','totalRequests','rps','avgTime','p50Time','p95Time','maxTime'].forEach(id => document.getElementById(id).textContent = '0');
+            expectedRunId = null;
 
             const probeResp = await fetch('/api/probe?base_url=' + encodeURIComponent(baseUrl));
             const probeData = await probeResp.json().catch(() => ({}));
@@ -176,11 +184,7 @@ HTML = """
                 return;
             }
 
-            document.getElementById('statusText').textContent = 'Starting...';
-
-            if (pollInterval) clearInterval(pollInterval);
-            pollInterval = setInterval(pollStatus, 500);
-            pollStatus();
+            document.getElementById('statusText').textContent = 'Starting load test...';
 
             const runResp = await fetch('/api/run', {
                 method: 'POST',
@@ -189,12 +193,13 @@ HTML = """
             });
             const runData = await runResp.json().catch(() => ({}));
             if (!runResp.ok) {
-                clearInterval(pollInterval);
                 document.getElementById('statusText').textContent = 'Start failed: ' + (runData.error || runResp.status);
                 document.getElementById('runBtn').disabled = false;
                 document.getElementById('stopBtn').style.display = 'none';
                 return;
             }
+
+            expectedRunId = runData.run_id;
             pollStatus();
         }
 
@@ -211,6 +216,19 @@ HTML = """
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
+
+                if (data.phase === 'stopping_previous') {
+                    document.getElementById('statusText').textContent = 'Stopping previous test...';
+                    return;
+                }
+
+                if (expectedRunId !== null && data.run_id !== expectedRunId) {
+                    return;
+                }
+
+                const running = expectedRunId !== null && !data.done;
+                document.getElementById('runBtn').disabled = running;
+                document.getElementById('stopBtn').style.display = running ? 'inline-block' : 'none';
 
                 const success = statNum(data.success);
                 const errors = statNum(data.errors);
@@ -230,7 +248,7 @@ HTML = """
                 document.getElementById('maxTime').textContent = statNum(data.max_ms);
 
                 if (data.error) {
-                    clearInterval(pollInterval);
+                    expectedRunId = null;
                     document.getElementById('statusText').textContent = 'Failed: ' + data.error;
                     document.getElementById('runBtn').disabled = false;
                     document.getElementById('stopBtn').style.display = 'none';
@@ -238,17 +256,33 @@ HTML = """
                 }
 
                 const meta = [data.build_id, data.host, data.run_id != null ? 'run#' + data.run_id : ''].filter(Boolean).join(' · ');
+                const errPart = errors > 0 ? `, ${errors} errors` : '';
 
                 if (data.done) {
-                    clearInterval(pollInterval);
-                    document.getElementById('statusText').textContent =
-                        `Done — ${total} requests in ${elapsed}s` + (meta ? ` (${meta})` : '');
+                    if (expectedRunId !== null || total > 0) {
+                        expectedRunId = null;
+                        document.getElementById('statusText').textContent =
+                            `Completed — ${total} requests in ${elapsed}s (${success} successful${errPart})` +
+                            (meta ? ` (${meta})` : '');
+                    } else if (expectedRunId === null && !data.done) {
+                        document.getElementById('statusText').textContent = 'Ready to start';
+                    }
                     document.getElementById('runBtn').disabled = false;
                     document.getElementById('stopBtn').style.display = 'none';
-                } else {
+                } else if (expectedRunId !== null) {
                     document.getElementById('statusText').textContent =
-                        `Running ${elapsed}s / ${duration}s — ${total} requests (${success} ok, ${errors} fail)` +
+                        `Running ${elapsed}s / ${duration}s — ${total} requests (${success} successful${errPart})` +
                         (meta ? ` [${meta}]` : '');
+                } else if (!data.done && total > 0) {
+                    expectedRunId = data.run_id;
+                    document.getElementById('results').classList.add('show');
+                    document.getElementById('statusText').textContent =
+                        `Running ${elapsed}s / ${duration}s — ${total} requests (${success} successful${errPart})` +
+                        (meta ? ` [${meta}]` : '');
+                    document.getElementById('runBtn').disabled = true;
+                    document.getElementById('stopBtn').style.display = 'inline-block';
+                } else {
+                    document.getElementById('statusText').textContent = 'Ready to start';
                 }
             } catch (err) {
                 document.getElementById('statusText').textContent = 'Status poll failed: ' + err.message;
@@ -276,6 +310,7 @@ def new_test_state(duration_s=60, run_id=0):
         "error": None,
         "host": socket.gethostname(),
         "build_id": BUILD_ID,
+        "phase": "idle",
     }
 
 
@@ -349,6 +384,13 @@ def run_test():
 
     stop_flag = True
     stop_event.set()
+    with state_lock:
+        current_run_id += 1
+        run_id = current_run_id
+        test_state = new_test_state(duration_s=duration, run_id=run_id)
+        test_state["done"] = False
+        test_state["phase"] = "stopping_previous"
+
     with load_thread_lock:
         if load_thread and load_thread.is_alive():
             load_thread.join(timeout=15)
@@ -357,10 +399,8 @@ def run_test():
     stop_flag = False
 
     with state_lock:
-        current_run_id += 1
-        run_id = current_run_id
-        test_state = new_test_state(duration_s=duration, run_id=run_id)
-        test_state["done"] = False
+        if run_id == current_run_id:
+            test_state["phase"] = "running"
 
     run_payload = {
         "base_url": base_url,
@@ -712,4 +752,44 @@ def update_stats_unlocked(latencies, start_time):
 if __name__ == "__main__":
     if not DEFAULT_PORT:
         raise SystemExit("PORT is required")
+
+    auto_run = os.getenv("AUTO_RUN", "").lower() in ("1", "true", "yes")
+
+    def _auto_start():
+        time.sleep(2)
+        if not DEFAULT_BASE_URL:
+            print("AUTO_RUN skipped: BASE_URL is empty", flush=True)
+            return
+        try:
+            concurrency = parse_positive_int(DEFAULT_CONCURRENCY, 10, "concurrency")
+            duration = parse_positive_int(DEFAULT_DURATION, 60, "duration")
+            base_url = normalize_base_url(DEFAULT_BASE_URL)
+        except ValueError as exc:
+            print(f"AUTO_RUN skipped: {exc}", flush=True)
+            return
+        print(
+            f"AUTO_RUN starting base_url={base_url} concurrency={concurrency} duration={duration}",
+            flush=True,
+        )
+        import urllib.request
+        payload = json.dumps({
+            "base_url": base_url,
+            "concurrency": concurrency,
+            "duration": duration,
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{DEFAULT_PORT}/api/run",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                print(f"AUTO_RUN response: {resp.read().decode()}", flush=True)
+        except Exception as exc:
+            print(f"AUTO_RUN failed: {exc}", flush=True)
+
+    if auto_run:
+        threading.Thread(target=_auto_start, daemon=True, name="auto-run").start()
+
     app.run(host="0.0.0.0", port=int(DEFAULT_PORT), threaded=True, use_reloader=False)
