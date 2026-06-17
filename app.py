@@ -5,15 +5,16 @@ import socket
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import httpx
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
-executor = ThreadPoolExecutor(max_workers=1)
 state_lock = threading.Lock()
+load_thread_lock = threading.Lock()
+load_thread = None
+stop_event = threading.Event()
 DEFAULT_BASE_URL = os.getenv("BASE_URL", "").strip()
 DEFAULT_CONCURRENCY = os.getenv("CONCURRENCY", "").strip() or "10"
 DEFAULT_DURATION = os.getenv("DURATION", "").strip() or "60"
@@ -55,8 +56,9 @@ def parse_user_id(user_obj):
 
 def make_http_client():
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(60.0, connect=15.0, pool=120.0),
-        limits=httpx.Limits(max_connections=25, max_keepalive_connections=15),
+        timeout=httpx.Timeout(30.0, connect=10.0, pool=60.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=25),
+        follow_redirects=True,
     )
 
 HTML = """
@@ -126,7 +128,7 @@ HTML = """
 
         <div class="results" id="results">
             <div class="progress">
-                <div class="status-text" id="statusText">Running...</div>
+                <div class="status-text" id="statusText">Ready to start</div>
                 <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
             </div>
             <div class="stats">
@@ -160,9 +162,21 @@ HTML = """
             document.getElementById('runBtn').disabled = true;
             document.getElementById('stopBtn').style.display = 'inline-block';
             document.getElementById('results').classList.add('show');
-            document.getElementById('statusText').textContent = 'Starting...';
+            document.getElementById('statusText').textContent = 'Checking connectivity...';
             document.getElementById('progressFill').style.width = '0%';
             ['successCount','errorCount','totalRequests','rps','avgTime','p50Time','p95Time','maxTime'].forEach(id => document.getElementById(id).textContent = '0');
+
+            const probeResp = await fetch('/api/probe?base_url=' + encodeURIComponent(baseUrl));
+            const probeData = await probeResp.json().catch(() => ({}));
+            if (!probeResp.ok || !probeData.ok) {
+                document.getElementById('statusText').textContent =
+                    'Cannot reach application: ' + (probeData.error || ('HTTP ' + probeResp.status));
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('stopBtn').style.display = 'none';
+                return;
+            }
+
+            document.getElementById('statusText').textContent = 'Starting...';
 
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollStatus, 500);
@@ -320,7 +334,7 @@ def normalize_base_url(url):
 
 @app.route("/api/run", methods=["POST"])
 def run_test():
-    global test_state, stop_flag, current_run_id
+    global test_state, stop_flag, current_run_id, load_thread
     data = request.json or {}
     try:
         base_url = normalize_base_url(data.get("base_url"))
@@ -334,19 +348,34 @@ def run_test():
         return jsonify({"error": str(exc)}), 400
 
     stop_flag = True
+    stop_event.set()
+    with load_thread_lock:
+        if load_thread and load_thread.is_alive():
+            load_thread.join(timeout=15)
+
+    stop_event.clear()
+    stop_flag = False
+
     with state_lock:
         current_run_id += 1
         run_id = current_run_id
         test_state = new_test_state(duration_s=duration, run_id=run_id)
         test_state["done"] = False
-    stop_flag = False
 
-    executor.submit(run_load_test, {
+    run_payload = {
         "base_url": base_url,
         "concurrency": concurrency,
         "duration": duration,
         "run_id": run_id,
-    })
+    }
+
+    def _run():
+        run_load_test(run_payload)
+
+    with load_thread_lock:
+        load_thread = threading.Thread(target=_run, daemon=True, name=f"load-test-{run_id}")
+        load_thread.start()
+
     return jsonify({
         "status": "started",
         "base_url": base_url,
@@ -360,7 +389,34 @@ def run_test():
 def stop_test():
     global stop_flag
     stop_flag = True
+    stop_event.set()
     return jsonify({"status": "stopping"})
+
+
+@app.route("/api/probe")
+def probe():
+    base_url = request.args.get("base_url") or DEFAULT_BASE_URL
+    try:
+        base_url = normalize_base_url(base_url)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    async def check():
+        async with make_http_client() as client:
+            resp = await client.get(f"{base_url}/api/catalogue/products")
+            return resp.status_code, resp.text[:200]
+
+    try:
+        status_code, body_preview = asyncio.run(check())
+        ok = 200 <= status_code < 300
+        return jsonify({
+            "ok": ok,
+            "base_url": base_url,
+            "status_code": status_code,
+            "body_preview": body_preview,
+        }), 200 if ok else 502
+    except Exception as exc:
+        return jsonify({"ok": False, "base_url": base_url, "error": str(exc)}), 502
 
 
 @app.route("/api/status")
@@ -387,12 +443,35 @@ def run_load_test(data):
         flush=True,
     )
 
+    async def probe_base_url():
+        async with make_http_client() as client:
+            resp = await client.get(f"{base_url}/api/catalogue/products")
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Probe failed with HTTP {resp.status_code} for {base_url}/api/catalogue/products"
+                )
+
+    try:
+        asyncio.run(probe_base_url())
+    except Exception as exc:
+        msg = f"Cannot reach application at {base_url}: {exc}"
+        print(f"LOAD_TEST_PROBE_FAIL run_id={run_id} {msg}", file=sys.stdout, flush=True)
+        with state_lock:
+            if run_id == current_run_id:
+                test_state["error"] = msg
+                test_state["done"] = True
+                test_state["elapsed_s"] = 0
+        return
+
     latencies = []
     start_time = time.time()
     auth_semaphore = asyncio.Semaphore(max(2, min(concurrency, 8)))
 
     def is_active_run():
         return run_id == current_run_id
+
+    def should_stop():
+        return stop_flag or stop_event.is_set() or not is_active_run()
 
     def touch_state():
         if not is_active_run():
@@ -411,7 +490,7 @@ def run_load_test(data):
             user_uuid = None
             cities = []
 
-            while (time.time() - start_time) < duration and not stop_flag:
+            while (time.time() - start_time) < duration and not should_stop():
                 token = None
                 user_uuid = None
 
@@ -543,6 +622,8 @@ def run_load_test(data):
                 await asyncio.sleep(random.uniform(0.5, 1.5))
 
     async def do_request(client, method, url, json=None, headers=None, latencies=None, start_time=None):
+        if should_stop():
+            return None
         req_start = time.time()
         try:
             resp = await client.request(method, url, json=json, headers=headers)
@@ -579,7 +660,7 @@ def run_load_test(data):
             return None
 
     async def elapsed_ticker():
-        while is_active_run() and (time.time() - start_time) < duration and not stop_flag:
+        while not should_stop() and (time.time() - start_time) < duration:
             touch_state()
             await asyncio.sleep(0.5)
 
@@ -598,16 +679,15 @@ def run_load_test(data):
                 test_state["error"] = logger_msg
     finally:
         with state_lock:
-            if run_id != current_run_id:
-                return
-            test_state["done"] = True
-            test_state["elapsed_s"] = round(time.time() - start_time, 1)
-            update_stats_unlocked(latencies, start_time)
-            summary = (
-                f"success={test_state['success']} errors={test_state['errors']} "
-                f"elapsed={test_state['elapsed_s']}s"
-            )
-        print(f"LOAD_TEST_END run_id={run_id} {summary}", file=sys.stdout, flush=True)
+            if run_id == current_run_id:
+                test_state["done"] = True
+                test_state["elapsed_s"] = round(time.time() - start_time, 1)
+                update_stats_unlocked(latencies, start_time)
+                summary = (
+                    f"success={test_state['success']} errors={test_state['errors']} "
+                    f"elapsed={test_state['elapsed_s']}s"
+                )
+                print(f"LOAD_TEST_END run_id={run_id} {summary}", file=sys.stdout, flush=True)
 
 
 def update_stats_unlocked(latencies, start_time):
